@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flashstudio-monolith
+  namespace: flash
+  labels:
+    app: flashstudio-monolith
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  selector:
+    matchLabels:
+      app: flashstudio-monolith
+  template:
+    metadata:
+      labels:
+        app: flashstudio-monolith
+    spec:
+      # imagePullSecrets only needed if you didn't attach ACR to AKS
+      # imagePullSecrets:
+      #   - name: acr-pull
+      containers:
+        - name: web
+          image: flashstudiocapstone.azurecr.io/flashstudio/monolith:gdrive-file-auth
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+
+          # --- Environment variables ---
+          env:
+            # Storage backend configuration (local or drive)
+            - name: STORAGE_BACKEND
+              value: "local"
+            # App configuration
+            - name: FLASK_ENV
+              value: "production"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: flashstudio-secrets
+                  key: DATABASE_URL
+
+          # Mount Google Drive credentials as file
+          # (Removed Google Drive credentials volume mount for local storage backend)
+
+          # ---- Health probes against /healthz on port 8000 ----
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+
+          # Give the app a little time to boot first
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 5
+
+      terminationGracePeriodSeconds: 30
+
+      # Volumes for Google Drive credentials
+      # (Removed Google Drive credentials secret volume; not needed for local storage backend)

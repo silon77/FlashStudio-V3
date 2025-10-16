@@ -1,0 +1,113 @@
+name: CI/CD - Flash Studio to AKS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+env:
+  IMAGE_NAME: flashstudio/monolith
+  # Google Drive secrets will be injected from GitHub Actions encrypted secrets
+  GOOGLE_DRIVE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS_JSON }}
+  GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+  # Optional advanced Drive settings (Shared Drive & delegation)
+  GOOGLE_DRIVE_SHARED_DRIVE_ID: ${{ secrets.GOOGLE_DRIVE_SHARED_DRIVE_ID }}
+  GOOGLE_DRIVE_DELEGATED_USER: ${{ secrets.GOOGLE_DRIVE_DELEGATED_USER }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # ---- Guardrails: fail fast if any secret missing ----
+    - name: Validate required secrets
+      run: |
+        # Assign secrets to shell variables explicitly to avoid accidental command parsing
+        AZURE_CREDENTIALS='${{ secrets.AZURE_CREDENTIALS }}'
+        ACR_LOGIN_SERVER='${{ secrets.ACR_LOGIN_SERVER }}'
+        RESOURCE_GROUP='${{ secrets.RESOURCE_GROUP }}'
+        AKS_CLUSTER_NAME='${{ secrets.AKS_CLUSTER_NAME }}'
+        NAMESPACE='${{ secrets.NAMESPACE }}'
+        GOOGLE_DRIVE_CREDENTIALS_JSON='${{ secrets.GOOGLE_DRIVE_CREDENTIALS_JSON }}'
+        GOOGLE_DRIVE_FOLDER_ID='${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}'
+        GOOGLE_DRIVE_SHARED_DRIVE_ID='${{ secrets.GOOGLE_DRIVE_SHARED_DRIVE_ID }}'
+        GOOGLE_DRIVE_DELEGATED_USER='${{ secrets.GOOGLE_DRIVE_DELEGATED_USER }}'
+
+        missing=0
+        for v in AZURE_CREDENTIALS ACR_LOGIN_SERVER RESOURCE_GROUP AKS_CLUSTER_NAME NAMESPACE GOOGLE_DRIVE_CREDENTIALS_JSON GOOGLE_DRIVE_FOLDER_ID; do
+          eval val="\${$v}"
+          if [ -z "$val" ]; then
+            echo "$v missing"; missing=1
+          else
+            printf '%s length=%s\n' "$v" "$(printf '%s' "$val" | wc -c)"
+          fi
+        done
+        if [ -n "$GOOGLE_DRIVE_SHARED_DRIVE_ID" ]; then printf 'GOOGLE_DRIVE_SHARED_DRIVE_ID length=%s\n' "$(printf '%s' "$GOOGLE_DRIVE_SHARED_DRIVE_ID" | wc -c)"; else echo "(Optional) GOOGLE_DRIVE_SHARED_DRIVE_ID not set"; fi
+        if [ -n "$GOOGLE_DRIVE_DELEGATED_USER" ]; then echo "GOOGLE_DRIVE_DELEGATED_USER set"; else echo "(Optional) GOOGLE_DRIVE_DELEGATED_USER not set"; fi
+        if [ $missing -ne 0 ]; then echo "One or more required secrets missing"; exit 1; fi
+
+    - name: Azure login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    # ---- Show which subscription/tenant we are in (debug) ----
+    - name: Show Azure context
+      run: |
+        az account show -o table
+        echo "ACR_LOGIN_SERVER=${{ secrets.ACR_LOGIN_SERVER }}"
+        echo "RG=${{ secrets.RESOURCE_GROUP }}  AKS=${{ secrets.AKS_CLUSTER_NAME }}  NS=${{ secrets.NAMESPACE }}"
+
+    # ---- Login to ACR using Azure session (no username/password needed) ----
+    - name: ACR login (via Azure)
+      run: |
+        ACR_NAME=$(echo "${{ secrets.ACR_LOGIN_SERVER }}" | cut -d. -f1)
+        echo "Logging into ACR: $ACR_NAME"
+        az acr login -n "$ACR_NAME"
+        az acr show -n "$ACR_NAME" -o table
+
+    - name: Build & push image to ACR
+      run: |
+        IMAGE_TAG=${GITHUB_SHA::7}
+        echo "Will build tag: $IMAGE_TAG"
+        docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG .
+        docker push  ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+    - name: Set AKS context
+      uses: azure/aks-set-context@v4
+      with:
+        resource-group: ${{ secrets.RESOURCE_GROUP }}
+        cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+    # (optional) ensure namespace exists
+    - name: Ensure namespace exists
+      run: |
+        kubectl get ns ${{ secrets.NAMESPACE }} >/dev/null 2>&1 || \
+        kubectl create ns ${{ secrets.NAMESPACE }}
+
+    - name: Create/Update Google Drive Secret
+      run: |
+        echo "Creating/Updating google-drive-secrets in namespace ${{ secrets.NAMESPACE }}"
+        kubectl delete secret google-drive-secrets --ignore-not-found -n ${{ secrets.NAMESPACE }}
+        # Create secret with credentials JSON and folder ID. The credentials JSON may contain newlines; we base64 round-trip to avoid parsing issues.
+        printf "%s" "${GOOGLE_DRIVE_CREDENTIALS_JSON}" > gdrive_creds.json
+        SECRET_ARGS="--from-file=service-account.json=gdrive_creds.json --from-literal=GOOGLE_DRIVE_FOLDER_ID=\"${GOOGLE_DRIVE_FOLDER_ID}\""
+        if [ -n "${GOOGLE_DRIVE_SHARED_DRIVE_ID}" ]; then
+          SECRET_ARGS="$SECRET_ARGS --from-literal=GOOGLE_DRIVE_SHARED_DRIVE_ID=\"${GOOGLE_DRIVE_SHARED_DRIVE_ID}\""
+        fi
+        if [ -n "${GOOGLE_DRIVE_DELEGATED_USER}" ]; then
+          SECRET_ARGS="$SECRET_ARGS --from-literal=GOOGLE_DRIVE_DELEGATED_USER=\"${GOOGLE_DRIVE_DELEGATED_USER}\""
+        fi
+        # shellcheck disable=SC2086
+        kubectl create secret generic google-drive-secrets $SECRET_ARGS -n ${{ secrets.NAMESPACE }}
+        echo "Google Drive secret created/updated."
+
+    - name: Deploy to AKS
+      run: |
+        kubectl -n ${{ secrets.NAMESPACE }} set image deployment/flashstudio-monolith \
+          web=${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:$IMAGE_TAG
+        kubectl -n ${{ secrets.NAMESPACE }} rollout status deployment/flashstudio-monolith
